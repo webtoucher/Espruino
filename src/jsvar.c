@@ -1154,10 +1154,10 @@ JsVar *jsvAsString(JsVar *v, bool unlockVar) {
       // Function found and it's not the default one - execute it
       JsVar *result = jspExecuteFunction(toStringFn,v,0,0);
       jsvUnLock(toStringFn);
-      return jsvAsString(result, true);
+      str = jsvAsString(result, true);
     } else {
       jsvUnLock(toStringFn);
-      return jsvNewFromString("[object Object]");
+      str = jsvNewFromString("[object Object]");
     }
   } else {
     const char *constChar = jsvGetConstString(v);
@@ -1854,17 +1854,14 @@ JsVar *jsvSkipOneNameAndUnLock(JsVar *a) {
 }
 
 
-/*
-jsvIsStringEqualOrStartsWith(A, B, false) is a proper A==B
-jsvIsStringEqualOrStartsWith(A, B, true) is A.startsWith(B)
- */
-bool jsvIsStringEqualOrStartsWith(JsVar *var, const char *str, bool isStartsWith) {
+
+bool jsvIsStringEqualOrStartsWithOffset(JsVar *var, const char *str, bool isStartsWith, size_t startIdx) {
   if (!jsvHasCharacterData(var)) {
     return 0; // not a string so not equal!
   }
 
   JsvStringIterator it;
-  jsvStringIteratorNew(&it, var, 0);
+  jsvStringIteratorNew(&it, var, startIdx);
   while (jsvStringIteratorHasChar(&it) && *str) {
     if (jsvStringIteratorGetChar(&it) != *str) {
       jsvStringIteratorFree(&it);
@@ -1877,6 +1874,14 @@ bool jsvIsStringEqualOrStartsWith(JsVar *var, const char *str, bool isStartsWith
             jsvStringIteratorGetChar(&it)==*str; // should both be 0 if equal
   jsvStringIteratorFree(&it);
   return eq;
+}
+
+/*
+jsvIsStringEqualOrStartsWith(A, B, false) is a proper A==B
+jsvIsStringEqualOrStartsWith(A, B, true) is A.startsWith(B)
+ */
+bool jsvIsStringEqualOrStartsWith(JsVar *var, const char *str, bool isStartsWith) {
+  return jsvIsStringEqualOrStartsWithOffset(var, str, isStartsWith, 0);
 }
 
 // Also see jsvIsBasicVarEqual
@@ -2309,6 +2314,16 @@ void jsvRemoveChild(JsVar *parent, JsVar *child) {
   if (jsvGetLastChild(parent) == childref) {
     jsvSetLastChild(parent, jsvGetPrevSibling(child));
     wasChild = true;
+    // If this was an array and we were the last
+    // element, update the length
+    if (jsvIsArray(parent)) {
+      JsVarInt l = 0;
+      // get index of last child
+      if (jsvGetLastChild(parent))
+        l = jsvGetIntegerAndUnLock(jsvLock(jsvGetLastChild(parent)))+1;
+      // set it
+      jsvSetArrayLength(parent, l, false);
+    }
   }
   // unlink from child list
   if (jsvGetPrevSibling(child)) {
@@ -2338,14 +2353,6 @@ void jsvRemoveAllChildren(JsVar *parent) {
     JsVar *v = jsvLock(jsvGetFirstChild(parent));
     jsvRemoveChild(parent, v);
     jsvUnLock(v);
-  }
-}
-
-void jsvRemoveNamedChild(JsVar *parent, const char *name) {
-  JsVar *child = jsvFindChildFromString(parent, name, false);
-  if (child) {
-    jsvRemoveChild(parent, child);
-    jsvUnLock(child);
   }
 }
 
@@ -2385,6 +2392,7 @@ JsVar *jsvObjectGetChild(JsVar *obj, const char *name, JsVarFlags createChild) {
 /// Set the named child of an object, and return the child (so you can choose to unlock it if you want)
 JsVar *jsvObjectSetChild(JsVar *obj, const char *name, JsVar *child) {
   assert(jsvHasChildren(obj));
+  if (!jsvHasChildren(obj)) return 0;
   // child can actually be a name (for instance if it is a named function)
   JsVar *childName = jsvFindChildFromString(obj, name, true);
   if (!childName) return 0; // out of memory
@@ -2395,6 +2403,14 @@ JsVar *jsvObjectSetChild(JsVar *obj, const char *name, JsVar *child) {
 
 void jsvObjectSetChildAndUnLock(JsVar *obj, const char *name, JsVar *child) {
   jsvUnLock(jsvObjectSetChild(obj, name, child));
+}
+
+void jsvObjectRemoveChild(JsVar *obj, const char *name) {
+  JsVar *child = jsvFindChildFromString(obj, name, false);
+  if (child) {
+    jsvRemoveChild(obj, child);
+    jsvUnLock(child);
+  }
 }
 
 int jsvGetChildren(JsVar *v) {
@@ -2496,8 +2512,7 @@ size_t jsvCountJsVarsUsed(JsVar *v) {
   return c;
 }
 
-
-JsVar *jsvGetArrayItem(const JsVar *arr, JsVarInt index) {
+JsVar *jsvGetArrayIndex(const JsVar *arr, JsVarInt index) {
   JsVarRef childref = jsvGetLastChild(arr);
   JsVarInt lastArrayIndex = 0;
   // Look at last non-string element!
@@ -2507,7 +2522,7 @@ JsVar *jsvGetArrayItem(const JsVar *arr, JsVarInt index) {
       lastArrayIndex = child->varData.integer;
       // it was the last element... sorted!
       if (lastArrayIndex == index) {
-        return jsvSkipNameAndUnLock(child);
+        return child;
       }
       jsvUnLock(child);
       break;
@@ -2527,7 +2542,7 @@ JsVar *jsvGetArrayItem(const JsVar *arr, JsVarInt index) {
 
       assert(jsvIsInt(child));
       if (child->varData.integer == index) {
-        return jsvSkipNameAndUnLock(child);
+        return child;
       }
       childref = jsvGetPrevSibling(child);
       jsvUnLock(child);
@@ -2540,13 +2555,28 @@ JsVar *jsvGetArrayItem(const JsVar *arr, JsVarInt index) {
 
       assert(jsvIsInt(child));
       if (child->varData.integer == index) {
-        return jsvSkipNameAndUnLock(child);
+        return child;
       }
       childref = jsvGetNextSibling(child);
       jsvUnLock(child);
     }
   }
   return 0; // undefined
+}
+
+JsVar *jsvGetArrayItem(const JsVar *arr, JsVarInt index) {
+  return jsvSkipNameAndUnLock(jsvGetArrayIndex(arr,index));
+}
+
+void jsvSetArrayItem(const JsVar *arr, JsVarInt index, JsVar *item) {
+  JsVar *indexVar = jsvGetArrayIndex(arr, index);
+  if (indexVar) {
+    jsvSetValueOfName(indexVar, item);
+  } else {
+    indexVar = jsvMakeIntoVariableName(jsvNewFromInteger(jsvGetInteger(index)), item);
+    jsvAddName(arr, indexVar);
+  }
+  jsvUnLock(indexVar);
 }
 
 // Get all elements from arr and put them in itemPtr (unless it'd overflow).
@@ -3260,6 +3290,39 @@ bool jsvGarbageCollect() {
   isMemoryBusy = false;
   return freedSomething;
 }
+
+#ifndef RELEASE
+// Dump any locked variables that aren't referenced from `global` - for debugging memory leaks
+void jsvDumpLockedVars() {
+  jsvGarbageCollect();
+  if (isMemoryBusy) return;
+  isMemoryBusy = true;
+  JsVarRef i;
+  // clear garbage collect flags
+  for (i=1;i<=jsVarsSize;i++)  {
+    JsVar *var = jsvGetAddressOf(i);
+    if ((var->flags&JSV_VARTYPEMASK) != JSV_UNUSED) { // if it is not unused
+      var->flags |= (JsVarFlags)JSV_GARBAGE_COLLECT;
+      // if we have a flat string, skip that many blocks
+      if (jsvIsFlatString(var))
+        i = (JsVarRef)(i+jsvGetFlatStringBlocks(var));
+    }
+  }
+  // Add global
+  jsvGarbageCollectMarkUsed(execInfo.root);
+  // Now dump any that aren't used!
+  for (i=1;i<=jsVarsSize;i++)  {
+    JsVar *var = jsvGetAddressOf(i);
+    if ((var->flags&JSV_VARTYPEMASK) != JSV_UNUSED) {
+      if (var->flags & JSV_GARBAGE_COLLECT) {
+        jsvGarbageCollectMarkUsed(var);
+        jsvTrace(var, 0);
+      }
+    }
+  }
+  isMemoryBusy = false;
+}
+#endif
 
 
 /** Remove whitespace to the right of a string - on MULTIPLE LINES */
